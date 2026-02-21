@@ -1,2 +1,2 @@
-aiogram
-python-dotenv
+python-telegram-bot>=20.0
+python-dotenv>=0.21.0
