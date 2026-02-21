@@ -1,276 +1,333 @@
-import os
+import logging
 import asyncio
 import sqlite3
-import random
-import logging
+import os
+import shutil
 from datetime import datetime
 from dotenv import load_dotenv
-
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, FSInputFile
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.exceptions import TelegramForbiddenError
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 
-# Logger Setup
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
+# Load environment variables
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
-# Admin ID ကို integer အဖြစ်သေချာပြောင်းလဲခြင်း
-try:
-    ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
-except ValueError:
-    logger.error("ADMIN_ID must be a valid number in .env file")
-    ADMIN_ID = 0
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
+# Initialize Bot and Dispatcher
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# --- Database Core ---
-def query_db(query, params=(), fetchone=False, commit=False):
-    """Database connection ကို ပိုမိုလုံခြုံစိတ်ချရအောင် handling လုပ်ပေးထားသော function"""
-    res = None
-    conn = sqlite3.connect('church_plus.db')
-    try:
-        c = conn.cursor()
-        c.execute(query, params)
-        if commit:
-            conn.commit()
-        res = c.fetchone() if fetchone else c.fetchall()
-    except Exception as e:
-        logger.error(f"Database error: {e}")
-    finally:
-        conn.close()
-    return res
-
+# --- Database Setup ---
 def init_db():
-    conn = sqlite3.connect('church_plus.db')
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS verses (id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS quizzes (id INTEGER PRIMARY KEY AUTOINCREMENT, question TEXT, a TEXT, b TEXT, c TEXT, d TEXT, correct TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS prayers (id INTEGER PRIMARY KEY AUTOINCREMENT, user_name TEXT, user_id INTEGER, content TEXT, date TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS members (user_id INTEGER PRIMARY KEY, username TEXT, joined_date TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS scores (user_id INTEGER PRIMARY KEY, name TEXT, points INTEGER DEFAULT 0)''')
+    conn = sqlite3.connect("church_bot.db")
+    cursor = conn.cursor()
+    # General Settings
+    cursor.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+    # Verses
+    cursor.execute("CREATE TABLE IF NOT EXISTS verses (id INTEGER PRIMARY KEY, content TEXT)")
+    # Birthdays
+    cursor.execute("CREATE TABLE IF NOT EXISTS birthdays (id INTEGER PRIMARY KEY, name TEXT, month INTEGER)")
+    # Prayers
+    cursor.execute("CREATE TABLE IF NOT EXISTS prayers (id INTEGER PRIMARY KEY, username TEXT, request TEXT, date TEXT)")
+    # Quizzes
+    cursor.execute("CREATE TABLE IF NOT EXISTS quizzes (id INTEGER PRIMARY KEY, question TEXT, a TEXT, b TEXT, c TEXT, d TEXT, answer TEXT)")
+    # Scores
+    cursor.execute("CREATE TABLE IF NOT EXISTS scores (user_id INTEGER PRIMARY KEY, name TEXT, points INTEGER DEFAULT 0)")
+    # Stats
+    cursor.execute("CREATE TABLE IF NOT EXISTS stats (chat_id INTEGER PRIMARY KEY, type TEXT)")
     
-    defaults = [
-        ('about', '💒 *အသင်းတော်အကြောင်း*\n\nအချက်အလက်များ မထည့်သွင်းရသေးပါ။'),
-        ('contact', '📞 *ဆက်သွယ်ရန်*\n\nဖုန်းနံပါတ်များ မရှိသေးပါ။'),
-        ('events', '📅 *လာမည့်အစီအစဉ်များ*\n\nလက်ရှိတွင် အစီအစဉ်သစ် မရှိသေးပါ။'),
-        ('birthday', '🎂 *ယခုလမွေးနေ့ရှင်များ*\n\nစာရင်းမရှိသေးပါ။')
-    ]
-    c.executemany("INSERT OR IGNORE INTO settings VALUES (?, ?)", defaults)
+    # Default values
+    defaults = [('about', 'History not set.'), ('contact', 'Contacts not set.'), ('events', 'No upcoming events.')]
+    cursor.executemany("INSERT OR IGNORE INTO settings VALUES (?, ?)", defaults)
+    
     conn.commit()
     conn.close()
 
-# --- Keyboards ---
-def main_menu():
-    builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="⛪ About", callback_data="about"), InlineKeyboardButton(text="📞 Contact", callback_data="contact"))
-    builder.row(InlineKeyboardButton(text="📖 Verse", callback_data="verse"), InlineKeyboardButton(text="📅 Events", callback_data="events"))
-    builder.row(InlineKeyboardButton(text="🎮 Quiz", callback_data="quiz"), InlineKeyboardButton(text="🎂 Birthday", callback_data="birthday"))
-    builder.row(InlineKeyboardButton(text="🙏 Pray", callback_data="pray_request_info"), InlineKeyboardButton(text="🏆 Leaderboard", callback_data="tops"))
-    return builder.as_markup()
+def get_setting(key):
+    conn = sqlite3.connect("church_bot.db")
+    val = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()[0]
+    conn.close()
+    return val
 
-# --- Handlers ---
+def log_chat(chat_id, chat_type):
+    conn = sqlite3.connect("church_bot.db")
+    conn.execute("INSERT OR IGNORE INTO stats (chat_id, type) VALUES (?, ?)", (chat_id, chat_type))
+    conn.commit()
+    conn.close()
+
+# --- User Commands ---
+
 @dp.message(Command("start"))
-async def cmd_start(message: Message):
-    query_db("INSERT OR IGNORE INTO members VALUES (?, ?, ?)", 
-             (message.from_user.id, message.from_user.username, datetime.now().strftime("%Y-%m-%d")), commit=True)
-    
-    welcome_text = (
-        f"🙏 **မင်္ဂလာပါ {message.from_user.first_name}!**\n\n"
-        "Church Community Bot မှ နွေးထွေးစွာ ကြိုဆိုပါသည်။ "
-        "အောက်ပါ Menu များကို အသုံးပြု၍ အချက်အလက်များကို ရယူနိုင်ပါသည်။\n\n"
-        "✨ *Created by : @Enoch_777*"
+async def cmd_start(message: types.Message):
+    log_chat(message.chat.id, message.chat.type)
+    welcome = (
+        "🙏 မင်္ဂလာပါ! Church Community Bot မှ ကြိုဆိုပါတယ်။\n\n"
+        "ဝိညာဉ်ရေးရာခွန်အားနှင့် အသင်းတော်သတင်းအချက်အလက်များအတွက် အသုံးပြုနိုင်ပါသည်။\n\n"
+        "ဖန်တီးသူ : @Enoch_777"
     )
-    await message.answer(welcome_text, reply_markup=main_menu(), parse_mode="Markdown")
+    await message.answer(welcome)
 
-@dp.callback_query(F.data == "about")
-async def show_about(callback: CallbackQuery):
-    res = query_db("SELECT value FROM settings WHERE key='about'", fetchone=True)
-    await callback.message.edit_text(res[0], reply_markup=main_menu(), parse_mode="Markdown")
+@dp.message(Command("help"))
+async def cmd_help(message: types.Message):
+    help_text = (
+        "📖 **အသုံးပြုပုံ လမ်းညွှန်**\n\n"
+        "/about - အသင်းတော်အကြောင်း\n"
+        "/contact - ဆက်သွယ်ရန်\n"
+        "/verse - နှုတ်ကပတ်တော်များ\n"
+        "/events - အစီအစဉ်များ\n"
+        "/birthday - ယခုလမွေးနေ့ရှင်များ\n"
+        "/pray - ဆုတောင်းချက်ပေးပို့ရန်\n"
+        "/quiz - ကျမ်းစာဉာဏ်စမ်း\n"
+        "/tops - ရမှတ်အများဆုံးစာရင်း\n"
+        "/report - သတင်းပေးပို့ရန်"
+    )
+    await message.answer(help_text, parse_mode="Markdown")
 
-@dp.callback_query(F.data == "contact")
-async def show_contact(callback: CallbackQuery):
-    res = query_db("SELECT value FROM settings WHERE key='contact'", fetchone=True)
-    await callback.message.edit_text(res[0], reply_markup=main_menu(), parse_mode="Markdown")
+@dp.message(Command("about"))
+async def cmd_about(message: types.Message):
+    await message.answer(f"ℹ️ **About Us**\n\n{get_setting('about')}", parse_mode="Markdown")
 
-@dp.callback_query(F.data == "verse")
-async def show_verse(callback: CallbackQuery):
-    verses = query_db("SELECT content FROM verses")
-    text = f"📖 *ယနေ့အတွက် နှုတ်ကပတ်တော်*\n\n{random.choice(verses)[0]}" if verses else "⚠️ ကျမ်းချက်များ မရှိသေးပါ။"
-    await callback.message.edit_text(text, reply_markup=main_menu(), parse_mode="Markdown")
+@dp.message(Command("contact"))
+async def cmd_contact(message: types.Message):
+    await message.answer(f"📞 **Contact Leaders**\n\n{get_setting('contact')}", parse_mode="Markdown")
 
-@dp.callback_query(F.data == "events")
-async def show_events(callback: CallbackQuery):
-    res = query_db("SELECT value FROM settings WHERE key='events'", fetchone=True)
-    await callback.message.edit_text(res[0], reply_markup=main_menu(), parse_mode="Markdown")
+@dp.message(Command("events"))
+async def cmd_events(message: types.Message):
+    await message.answer(f"📅 **Upcoming Events**\n\n{get_setting('events')}", parse_mode="Markdown")
 
-@dp.callback_query(F.data == "birthday")
-async def show_birthday(callback: CallbackQuery):
-    res = query_db("SELECT value FROM settings WHERE key='birthday'", fetchone=True)
-    await callback.message.edit_text(res[0], reply_markup=main_menu(), parse_mode="Markdown")
-
-@dp.callback_query(F.data == "pray_request_info")
-async def pray_info(callback: CallbackQuery):
-    await callback.answer("ဆုတောင်းစာပို့ရန် /pray <စာ> ဟု ရိုက်ပို့ပေးပါ။", show_alert=True)
-
-# --- Quiz System ---
-@dp.callback_query(F.data == "quiz")
-async def start_quiz(callback: CallbackQuery):
-    quizzes = query_db("SELECT * FROM quizzes")
-    if not quizzes:
-        return await callback.answer("မေးခွန်းများ မရှိသေးပါ။", show_alert=True)
-    
-    q = random.choice(quizzes)
-    builder = InlineKeyboardBuilder()
-    # Data Format: q_ans:UserChoice:CorrectChoice
-    for choice in ['A', 'B', 'C', 'D']:
-        builder.add(InlineKeyboardButton(text=choice, callback_data=f"q_ans:{choice}:{q[6]}"))
-    
-    text = f"❓ *Bible Quiz*\n\n{q[1]}\n\nA) {q[2]}\nB) {q[3]}\nC) {q[4]}\nD) {q[5]}"
-    await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
-
-@dp.callback_query(F.data.startswith("q_ans:"))
-async def check_quiz(callback: CallbackQuery):
-    _, user_choice, correct_ans = callback.data.split(":")
-    if user_choice == correct_ans:
-        query_db("INSERT OR IGNORE INTO scores (user_id, name, points) VALUES (?, ?, 0)", 
-                 (callback.from_user.id, callback.from_user.first_name), commit=True)
-        query_db("UPDATE scores SET points = points + 10 WHERE user_id = ?", (callback.from_user.id,), commit=True)
-        await callback.answer("🎯 မှန်ကန်ပါတယ်။ (+၁၀ မှတ်)", show_alert=True)
+@dp.message(Command("verse"))
+async def cmd_verse(message: types.Message):
+    conn = sqlite3.connect("church_bot.db")
+    verse = conn.execute("SELECT content FROM verses ORDER BY RANDOM() LIMIT 1").fetchone()
+    conn.close()
+    if verse:
+        await message.answer(f"📖 **Today's Verse**\n\n{verse[0]}", parse_mode="Markdown")
     else:
-        await callback.answer(f"❌ မှားယွင်းပါတယ်။ အဖြေမှန်မှာ {correct_ans} ဖြစ်ပါတယ်။", show_alert=True)
-    
-    # ဖြေပြီးရင် Main Menu ပြန်ပို့ပေးမယ်
-    res = query_db("SELECT value FROM settings WHERE key='about'", fetchone=True)
-    await callback.message.edit_text(res[0], reply_markup=main_menu(), parse_mode="Markdown")
+        await message.answer("ကျမ်းချက်များ မရှိသေးပါ။")
 
-@dp.callback_query(F.data == "tops")
-async def show_tops(callback: CallbackQuery):
-    tops = query_db("SELECT name, points FROM scores ORDER BY points DESC LIMIT 10")
-    text = "🏆 *Quiz Leaderboard*\n\n"
-    if not tops: 
-        text += "မှတ်တမ်း မရှိသေးပါ။"
+@dp.message(Command("birthday"))
+async def cmd_birthday(message: types.Message):
+    this_month = datetime.now().month
+    conn = sqlite3.connect("church_bot.db")
+    members = conn.execute("SELECT name FROM birthdays WHERE month=?", (this_month,)).fetchall()
+    conn.close()
+    if members:
+        list_str = "\n".join([f"🎂 {m[0]}" for m in members])
+        await message.answer(f"🎉 **ယခုလ မွေးနေ့ရှင်များ**\n\n{list_str}")
     else:
-        for i, row in enumerate(tops, 1):
-            text += f"{i}. {row[0]} — {row[1]} Pts\n"
-    await callback.message.edit_text(text, reply_markup=main_menu(), parse_mode="Markdown")
+        await message.answer("ယခုလတွင် မွေးနေ့ရှိသူ မရှိပါ။")
 
-# --- Admin Section ---
+@dp.message(Command("pray"))
+async def cmd_pray(message: types.Message):
+    text = message.text.replace("/pray", "").strip()
+    if not text:
+        return await message.answer("ကျေးဇူးပြု၍ `/pray <ဆုတောင်းချက်>` ဟု ရေးပေးပါ။")
+    
+    conn = sqlite3.connect("church_bot.db")
+    conn.execute("INSERT INTO prayers (username, request, date) VALUES (?, ?, ?)", 
+                 (f"@{message.from_user.username}", text, datetime.now().strftime("%Y-%m-%d")))
+    conn.commit()
+    conn.close()
+    await message.answer("🙏 သင်၏ ဆုတောင်းချက်ကို မှတ်တမ်းတင်ပြီးပါပြီ။")
+
+@dp.message(Command("quiz"))
+async def cmd_quiz(message: types.Message):
+    conn = sqlite3.connect("church_bot.db")
+    q = conn.execute("SELECT id, question, a, b, c, d FROM quizzes ORDER BY RANDOM() LIMIT 1").fetchone()
+    conn.close()
+    if not q:
+        return await message.answer("ဉာဏ်စမ်းများ မရှိသေးပါ။")
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"A: {q[2]}", callback_data=f"q_{q[0]}_a")],
+        [InlineKeyboardButton(text=f"B: {q[3]}", callback_data=f"q_{q[0]}_b")],
+        [InlineKeyboardButton(text=f"C: {q[4]}", callback_data=f"q_{q[0]}_c")],
+        [InlineKeyboardButton(text=f"D: {q[5]}", callback_data=f"q_{q[0]}_d")]
+    ])
+    await message.answer(f"❓ {q[1]}", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("q_"))
+async def handle_quiz_answer(callback: types.CallbackQuery):
+    _, q_id, user_ans = callback.data.split("_")
+    conn = sqlite3.connect("church_bot.db")
+    correct_ans = conn.execute("SELECT answer FROM quizzes WHERE id=?", (q_id,)).fetchone()[0]
+    
+    if user_ans.upper() == correct_ans.upper():
+        conn.execute("INSERT INTO scores (user_id, name, points) VALUES (?, ?, 1) ON CONFLICT(user_id) DO UPDATE SET points=points+1", 
+                     (callback.from_user.id, callback.from_user.full_name))
+        conn.commit()
+        await callback.answer("✅ မှန်ကန်ပါတယ်! +1 မှတ်", show_alert=True)
+    else:
+        await callback.answer(f"❌ မှားယွင်းပါတယ်။ အဖြေမှန်မှာ {correct_ans.upper()} ဖြစ်ပါတယ်။", show_alert=True)
+    conn.close()
+    await callback.message.delete()
+
+@dp.message(Command("tops"))
+async def cmd_tops(message: types.Message):
+    conn = sqlite3.connect("church_bot.db")
+    ranks = conn.execute("SELECT name, points FROM scores ORDER BY points DESC LIMIT 10").fetchall()
+    conn.close()
+    if ranks:
+        res = "\n".join([f"{i+1}. {r[0]} - {r[1]} pts" for i, r in enumerate(ranks)])
+        await message.answer(f"🏆 **Quiz Ranking**\n\n{res}")
+    else:
+        await message.answer("ရမှတ်စာရင်း မရှိသေးပါ။")
+
+# --- Admin Commands ---
+
 def is_admin(user_id):
     return user_id == ADMIN_ID
 
 @dp.message(Command("edabout"))
-async def ed_about(message: Message):
+async def ed_about(message: types.Message):
     if not is_admin(message.from_user.id): return
-    content = message.text.replace("/edabout", "").strip()
-    if content:
-        query_db("UPDATE settings SET value=? WHERE key='about'", (content,), commit=True)
-        await message.reply("✅ About content updated!")
+    text = message.text.replace("/edabout", "").strip()
+    if text:
+        conn = sqlite3.connect("church_bot.db")
+        conn.execute("UPDATE settings SET value=? WHERE key='about'", (text,))
+        conn.commit() ; conn.close()
+        await message.answer("✅ About update အောင်မြင်သည်။")
 
 @dp.message(Command("edcontact"))
-async def ed_contact(message: Message):
+async def ed_contact(message: types.Message):
     if not is_admin(message.from_user.id): return
-    content = message.text.replace("/edcontact", "").strip()
-    if content:
-        query_db("UPDATE settings SET value=? WHERE key='contact'", (content,), commit=True)
-        await message.reply("✅ Contact content updated!")
+    text = message.text.replace("/edcontact", "").strip()
+    if text:
+        conn = sqlite3.connect("church_bot.db")
+        conn.execute("UPDATE settings SET value=? WHERE key='contact'", (text,))
+        conn.commit() ; conn.close()
+        await message.answer("✅ Contact update အောင်မြင်သည်။")
+
+@dp.message(Command("edevents"))
+async def ed_events(message: types.Message):
+    if not is_admin(message.from_user.id): return
+    text = message.text.replace("/edevents", "").strip()
+    if text:
+        conn = sqlite3.connect("church_bot.db")
+        conn.execute("UPDATE settings SET value=? WHERE key='events'", (text,))
+        conn.commit() ; conn.close()
+        await message.answer("✅ Events update အောင်မြင်သည်။")
 
 @dp.message(Command("edverse"))
-async def ed_verse(message: Message):
+async def ed_verse(message: types.Message):
     if not is_admin(message.from_user.id): return
-    lines = message.text.split("\n")[1:]
-    added = 0
-    for line in lines:
-        if line.strip():
-            query_db("INSERT INTO verses (content) VALUES (?)", (line.strip(),), commit=True)
-            added += 1
-    await message.reply(f"✅ {added} verses added!")
+    # Usage: /edverse Verse text here (One per line for multiple)
+    lines = message.text.replace("/edverse", "").strip().split("\n")
+    if lines:
+        conn = sqlite3.connect("church_bot.db")
+        for line in lines:
+            if line.strip(): conn.execute("INSERT INTO verses (content) VALUES (?)", (line.strip(),))
+        conn.commit() ; conn.close()
+        await message.answer(f"✅ Verses {len(lines)} ခု ထည့်ပြီးပါပြီ။")
+
+@dp.message(Command("edbirthday"))
+async def ed_birthday(message: types.Message):
+    if not is_admin(message.from_user.id): return
+    # Usage: /edbirthday Name|Month_Number
+    data = message.text.replace("/edbirthday", "").strip().split("|")
+    if len(data) == 2:
+        conn = sqlite3.connect("church_bot.db")
+        conn.execute("INSERT INTO birthdays (name, month) VALUES (?, ?)", (data[0].strip(), int(data[1].strip())))
+        conn.commit() ; conn.close()
+        await message.answer("✅ Birthday list ထည့်ပြီးပါပြီ။")
 
 @dp.message(Command("edquiz"))
-async def ed_quiz(message: Message):
+async def ed_quiz(message: types.Message):
     if not is_admin(message.from_user.id): return
-    try:
-        data = message.text.replace("/edquiz", "").strip().split("|")
-        # Format: Question | A | B | C | D | CorrectLetter
-        query_db("INSERT INTO quizzes (question, a, b, c, d, correct) VALUES (?, ?, ?, ?, ?, ?)", 
-                 (data[0].strip(), data[1].strip(), data[2].strip(), data[3].strip(), data[4].strip(), data[5].strip().upper()), commit=True)
-        await message.reply("✅ Quiz added!")
-    except:
-        await message.reply("❌ Format: `/edquiz Question | A | B | C | D | A`", parse_mode="Markdown")
-
-@dp.message(Command("pray"))
-async def pray_user(message: Message):
-    content = message.text.replace("/pray", "").strip()
-    if not content: 
-        return await message.reply("အသုံးပြုပုံ- `/pray [စာ]`", parse_mode="Markdown")
-    query_db("INSERT INTO prayers (user_name, user_id, content, date) VALUES (?, ?, ?, ?)",
-             (message.from_user.full_name, message.from_user.id, content, datetime.now().strftime("%d/%m/%Y")), commit=True)
-    await message.answer("🙏 ဆုတောင်းစာ ပေးပို့ပြီးပါပြီ။")
+    # Usage: /edquiz Question|A|B|C|D|CorrectLetter
+    data = message.text.replace("/edquiz", "").strip().split("|")
+    if len(data) == 6:
+        conn = sqlite3.connect("church_bot.db")
+        conn.execute("INSERT INTO quizzes (question, a, b, c, d, answer) VALUES (?,?,?,?,?,?)", 
+                     (data[0], data[1], data[2], data[3], data[4], data[5]))
+        conn.commit() ; conn.close()
+        await message.answer("✅ Quiz ထည့်ပြီးပါပြီ။")
 
 @dp.message(Command("praylist"))
-async def pray_list(message: Message):
+async def cmd_praylist(message: types.Message):
     if not is_admin(message.from_user.id): return
-    prayers = query_db("SELECT user_name, content, date FROM prayers ORDER BY id DESC LIMIT 10")
-    text = "📝 *Recent Prayer Requests*\n\n"
-    for p in prayers:
-        text += f"👤 *{p[0]}* ({p[2]}): {p[1]}\n\n"
-    await message.answer(text if prayers else "စာရင်းမရှိပါ။", parse_mode="Markdown")
-
-@dp.message(Command("broadcast"))
-async def broadcast(message: Message):
-    if not is_admin(message.from_user.id): return
-    if not message.reply_to_message:
-        return await message.reply("Broadcast လုပ်မည့်စာ/ပုံကို Reply ပြန်ပါ။")
-    
-    users = query_db("SELECT user_id FROM members")
-    count = 0
-    for u in users:
-        try:
-            await bot.copy_message(u[0], message.chat.id, message.reply_to_message.message_id)
-            count += 1
-            await asyncio.sleep(0.05) # Flood limit ရှောင်ရန်
-        except TelegramForbiddenError:
-            continue # Bot ကို block ထားသူများကိုကျော်သွားမည်
-        except Exception:
-            continue
-    await message.answer(f"📢 ပို့ပြီးသည့်လူဦးရေ: {count}")
+    conn = sqlite3.connect("church_bot.db")
+    prays = conn.execute("SELECT username, request, date FROM prayers ORDER BY id DESC LIMIT 20").fetchall()
+    conn.close()
+    if prays:
+        res = "\n---\n".join([f"👤 {p[0]} ({p[2]}):\n{p[1]}" for p in prays])
+        await message.answer(f"🙏 **Recent Prayer Requests**\n\n{res}")
+    else:
+        await message.answer("ဆုတောင်းချက် မရှိသေးပါ။")
 
 @dp.message(Command("stats"))
-async def show_stats(message: Message):
+async def cmd_stats(message: types.Message):
     if not is_admin(message.from_user.id): return
-    u_count = query_db("SELECT COUNT(*) FROM members", fetchone=True)[0]
-    p_count = query_db("SELECT COUNT(*) FROM prayers", fetchone=True)[0]
-    await message.answer(f"📊 *Statistics*\nTotal Users: {u_count}\nPrayers: {p_count}", parse_mode="Markdown")
+    conn = sqlite3.connect("church_bot.db")
+    users = conn.execute("SELECT COUNT(*) FROM stats WHERE type='private'").fetchone()[0]
+    groups = conn.execute("SELECT COUNT(*) FROM stats WHERE type IN ('group', 'supergroup')").fetchone()[0]
+    conn.close()
+    await message.answer(f"📊 **Bot Statistics**\n\nUsers: {users}\nGroups: {groups}")
+
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(message: types.Message):
+    if not is_admin(message.from_user.id): return
+    
+    conn = sqlite3.connect("church_bot.db")
+    chats = conn.execute("SELECT chat_id FROM stats WHERE type IN ('group', 'supergroup')").fetchall()
+    conn.close()
+    
+    count = 0
+    msg_text = message.caption if message.photo else message.text.replace("/broadcast", "").strip()
+    
+    for chat in chats:
+        try:
+            if message.photo:
+                await bot.send_photo(chat[0], message.photo[-1].file_id, caption=msg_text)
+            else:
+                await bot.send_message(chat[0], msg_text)
+            count += 1
+            await asyncio.sleep(0.1) # Prevent flooding
+        except:
+            continue
+    await message.answer(f"📢 Broadcast ပို့လွှတ်မှုပြီးဆုံး (Groups: {count})")
 
 @dp.message(Command("backup"))
-async def db_backup(message: Message):
+async def cmd_backup(message: types.Message):
     if not is_admin(message.from_user.id): return
-    if os.path.exists('church_plus.db'):
-        db_file = FSInputFile("church_plus.db")
-        await message.answer_document(db_file, caption="Database Backup")
-    else:
-        await message.answer("Database file not found!")
+    shutil.copyfile("church_bot.db", "backup_church.db")
+    file = FSInputFile("backup_church.db")
+    await message.answer_document(file, caption="Database Backup Success.")
+
+@dp.message(Command("restore"))
+async def cmd_restore(message: types.Message, bot: Bot):
+    if not is_admin(message.from_user.id): return
+    if not message.document:
+        return await message.answer("Database ဖိုင်ကို upload တင်ပြီး /restore ဟု caption ရေးပေးပါ။")
+    
+    await bot.download(message.document, destination="church_bot.db")
+    await message.answer("✅ Data restored successfully.")
 
 @dp.message(Command("allclear"))
-async def clear_data(message: Message):
+async def cmd_clear(message: types.Message):
     if not is_admin(message.from_user.id): return
-    query_db("DELETE FROM prayers", commit=True)
-    query_db("DELETE FROM verses", commit=True)
-    query_db("DELETE FROM quizzes", commit=True)
-    await message.answer("🗑 ဒေတာများအားလုံး ရှင်းလင်းပြီးပါပြီ။")
+    conn = sqlite3.connect("church_bot.db")
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM verses")
+    cursor.execute("DELETE FROM prayers")
+    cursor.execute("DELETE FROM quizzes")
+    cursor.execute("DELETE FROM scores")
+    conn.commit() ; conn.close()
+    await message.answer("⚠️ All Data Cleared (except settings and stats).")
 
+@dp.message(Command("report"))
+async def cmd_report(message: types.Message):
+    text = message.text.replace("/report", "").strip()
+    if text:
+        await bot.send_message(ADMIN_ID, f"🚩 **New Report from {message.from_user.full_name}**:\n\n{text}")
+        await message.answer("ကျေးဇူးတင်ပါတယ်။ သတင်းပို့ချက်ကို Admin ထံ ပေးပို့လိုက်ပါပြီ။")
+
+# --- Startup ---
 async def main():
     init_db()
-    logger.info("Bot is starting...")
+    logging.basicConfig(level=logging.INFO)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot stopped!")
+    asyncio.run(main())
