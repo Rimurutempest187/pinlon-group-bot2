@@ -17,13 +17,11 @@ from datetime import datetime
 from functools import wraps
 from typing import Optional, Tuple, Dict
 
-from dotenv import load_dotenv
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
-    ChatAction,
 )
 from telegram.ext import (
     ApplicationBuilder,
