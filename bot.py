@@ -1,12 +1,4 @@
-# Church Community Telegram Bot — Ready-to-run
 
-This document contains three files you requested: **bot.py**, **requirements.txt**, and **.env.example**. Copy the contents into three files in the same folder, install dependencies, fill `.env` with your real values (rename `.env.example` to `.env`), then run `python bot.py`.
-
----
-
-## File: `bot.py`
-
-```python
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
